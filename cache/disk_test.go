@@ -3,8 +3,8 @@ package cache
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +20,7 @@ func tempDir(t *testing.T) string {
 	return dir
 }
 
-func checkItems(t *testing.T, cache *fsCache, expSize int64, expNum int) {
+func checkItems(t *testing.T, cache *diskCache, expSize int64, expNum int) {
 	if cache.lru.Len() != expNum {
 		t.Fatalf("expected %d files in the cache, found %d", expNum, cache.lru.Len())
 	}
@@ -38,28 +38,13 @@ func checkItems(t *testing.T, cache *fsCache, expSize int64, expNum int) {
 	numFiles := 0
 	filepath.Walk(cache.dir, func(name string, info os.FileInfo, err error) error {
 		if !info.IsDir() {
-			numFiles += 1
+			numFiles++
 		}
 		return nil
 	})
 
 	if numFiles != expNum {
 		t.Fatalf("expected %d files on disk, found %d", expNum, numFiles)
-	}
-}
-
-func expectContentEquals(t *testing.T, c Cache, key string, content []byte) {
-	rr := httptest.NewRecorder()
-	found, err := c.Get(key, rr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found {
-		t.Fatalf("expected item at key %s to exist", key)
-	}
-	if bytes.Compare(rr.Body.Bytes(), []byte(content)) != 0 {
-		t.Fatalf("expected item at key %s to contain '%s', but got '%s'",
-			rr.Body.Bytes(), content)
 	}
 }
 
@@ -70,17 +55,16 @@ const CONTENTS_HASH = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e730433629
 func TestCacheBasics(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer os.RemoveAll(cacheDir)
-	cache := NewFsCache(cacheDir, 100)
+	cache := NewDiskCache(cacheDir, 100)
 
-	checkItems(t, cache, 0, 0)
+	checkItems(t, cache.(*diskCache), 0, 0)
 
 	// Non-existing item
-	rr := httptest.NewRecorder()
-	found, err := cache.Get(KEY, rr)
+	data, sizeBytes, err := cache.Get(KEY, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if found {
+	if data != nil {
 		t.Fatal("expected the item not to exist")
 	}
 
@@ -92,16 +76,20 @@ func TestCacheBasics(t *testing.T) {
 
 	// Dig into the internals to make sure that the cache state has been
 	// updated correctly
-	checkItems(t, cache, int64(len(CONTENTS)), 1)
+	checkItems(t, cache.(*diskCache), int64(len(CONTENTS)), 1)
 
 	// Get the item back
-	expectContentEquals(t, cache, KEY, []byte(CONTENTS))
+	data, sizeBytes, err = cache.Get(KEY, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectContentEquals(t, data, sizeBytes, []byte(CONTENTS))
 }
 
 func TestCacheEviction(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer os.RemoveAll(cacheDir)
-	cache := NewFsCache(cacheDir, 10)
+	cache := NewDiskCache(cacheDir, 10)
 
 	expectedSizesNumItems := []struct {
 		expSize int64
@@ -123,7 +111,24 @@ func TestCacheEviction(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		checkItems(t, cache, thisExp.expSize, thisExp.expNum)
+		checkItems(t, cache.(*diskCache), thisExp.expSize, thisExp.expNum)
+	}
+}
+
+func expectContentEquals(t *testing.T, data io.ReadCloser, sizeBytes int64, expectedContent []byte) {
+	if data == nil {
+		t.Fatal("expected the item to exist")
+	}
+	dataBytes, err := ioutil.ReadAll(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Compare(dataBytes, expectedContent) != 0 {
+		t.Fatalf("expected response '%s', but received '%s'",
+			dataBytes, CONTENTS)
+	}
+	if int64(len(dataBytes)) != sizeBytes {
+		t.Fatalf("Expected sizeBytes to be '%d' but was '%d'", len(dataBytes), sizeBytes)
 	}
 }
 
@@ -131,27 +136,35 @@ func TestCacheEviction(t *testing.T) {
 func TestOverwrite(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer os.RemoveAll(cacheDir)
-	cache := NewFsCache(cacheDir, 10)
+	cache := NewDiskCache(cacheDir, 10)
 
 	oldContent := "Hello"
 	newContent := "World"
 
-	err := cache.Put(KEY, 1, "", strings.NewReader(oldContent));
+	err := cache.Put(KEY, 1, "", strings.NewReader(oldContent))
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	data, sizeBytes, err := cache.Get(KEY, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Get the item back
-	expectContentEquals(t, cache, KEY, []byte(oldContent))
+	expectContentEquals(t, data, sizeBytes, []byte(oldContent))
 
 	// Overwrite
-	err = cache.Put(KEY, 1, "", strings.NewReader(newContent));
+	err = cache.Put(KEY, 1, "", strings.NewReader(newContent))
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	data, sizeBytes, err = cache.Get(KEY, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Get the item back again
-	expectContentEquals(t, cache, KEY, []byte(newContent))
+	expectContentEquals(t, data, sizeBytes, []byte(newContent))
 }
 
 func TestCacheExistingFiles(t *testing.T) {
@@ -177,20 +190,17 @@ func TestCacheExistingFiles(t *testing.T) {
 	}
 
 	const expectedSize = 3 * int64(len(CONTENTS))
-	cache := NewFsCache(cacheDir, expectedSize)
+	cache := NewDiskCache(cacheDir, expectedSize)
 
-	checkItems(t, cache, expectedSize, 3)
+	checkItems(t, cache.(*diskCache), expectedSize, 3)
 
 	// Adding a new file should evict items[0] (the oldest)
 	err := cache.Put("a-key", int64(len(CONTENTS)), CONTENTS_HASH, strings.NewReader(CONTENTS))
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkItems(t, cache, expectedSize, 3)
-	found, err := cache.Contains(items[0])
-	if err != nil {
-		t.Fatal(err)
-	}
+	checkItems(t, cache.(*diskCache), expectedSize, 3)
+	found := cache.Contains(items[0], false)
 	if found {
 		t.Fatalf("%s should have been evicted", items[0])
 	}
@@ -201,7 +211,7 @@ func TestCacheExistingFiles(t *testing.T) {
 func TestCacheTooBig(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer os.RemoveAll(cacheDir)
-	cache := NewFsCache(cacheDir, 100)
+	cache := NewDiskCache(cacheDir, 100)
 
 	err := cache.Put("a-key", 10000, "", strings.NewReader(CONTENTS))
 	if err == nil {
@@ -218,7 +228,7 @@ func TestCacheTooBig(t *testing.T) {
 func TestCacheCorruptedFile(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer os.RemoveAll(cacheDir)
-	cache := NewFsCache(cacheDir, 1000)
+	cache := NewDiskCache(cacheDir, 1000)
 
 	err := cache.Put(KEY, int64(len(CONTENTS)), strings.Repeat("x", 64), strings.NewReader(CONTENTS))
 	if err == nil {
